@@ -460,9 +460,14 @@ class CheckpointManager:
             return
 
         begin = time.monotonic()
-        if not self.ft_manager or self.ft_manager.participating_rank() == 0:
+        if not self.ft_manager \
+            or self.ft_manager.participating_rank() == 0 \
+            or self.ft_config.semi_sync_method != None:
             logger.info("Saving the checkpoint (or staging if async is enabled).")
             checkpoint_id = self._create_checkpoint_id(curr_step)
+
+            if self.ft_config.semi_sync_method != None:
+                checkpoint_id = os.path.join(checkpoint_id, f"ft-replica-{self.ft_replica_id}")
             self._async_wait()
             # This GC is called for async checkpoint as it is useless to do
             # GC right after async_save -- the CPU memory is not able to be
@@ -577,6 +582,9 @@ class CheckpointManager:
             model_only = step == 0
             checkpoint_id = self._create_checkpoint_id(step)
 
+            if self.ft_config.semi_sync_method != None:
+                checkpoint_id = os.path.join(checkpoint_id, f"ft-replica-{self.ft_replica_id}")
+
             if not os.path.isdir(checkpoint_id):
                 raise FileNotFoundError(
                     f"--checkpoint.load_step={step} but checkpoint {checkpoint_id} is not found."
@@ -628,10 +636,24 @@ class CheckpointManager:
             safetensors_metadata_probe = os.path.join(
                 folder, filename, "model.safetensors.index.json"
             )
-            if match and os.path.isfile(dcp_metadata_probe):
-                step_counts.append(int(match.group(1)))
-            elif match and os.path.isfile(safetensors_metadata_probe):
-                step_counts.append(int(match.group(1)))
+            if not match:
+                continue
+
+            if self.ft_config.semi_sync_method != None:
+                metadata_flag = True
+                # check that all replicas have metadata files
+                for replica_id in range(self.ft_config.group_size):
+                    metadata_probe = os.path.join(folder, filename, f"ft-replica-{replica_id}", ".metadata")
+                    metadata_flag = metadata_flag and os.path.isfile(metadata_probe)
+
+                if metadata_flag:
+                    step_counts.append(int(match.group(1)))
+            else:
+                if match and os.path.isfile(dcp_metadata_probe):
+                    step_counts.append(int(match.group(1)))
+                elif match and os.path.isfile(safetensors_metadata_probe):
+                    step_counts.append(int(match.group(1)))
+
         if not step_counts:
             return -1
         return max(step_counts)
@@ -644,6 +666,9 @@ class CheckpointManager:
         return os.path.join(folder, f"step-{step}")
 
     def _ft_save(self, step: int) -> None:
+        if self.ft_config.semi_sync_method != None:
+            return
+
         begin = time.monotonic()
         self._async_wait()
         checkpoint_id = self._create_checkpoint_id(step, folder=self._ft_folder())
@@ -653,6 +678,9 @@ class CheckpointManager:
         logger.info(f"Staging ft checkpoint took {time.monotonic() - begin} secs.")
 
     def _ft_load(self) -> None:
+        if self.ft_config.semi_sync_method != None:
+            return
+
         step = self._find_load_step(folder=self._ft_folder())
         if step == -1:
             return

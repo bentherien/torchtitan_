@@ -299,12 +299,37 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.step = 0
         self.ntokens_seen = 0
 
+        self.semi_sync = maybe_semi_sync_training(
+            job_config.fault_tolerance,
+            ft_manager=self.ft_manager,
+            model=self.model_parts[0],
+            n_layers=(
+                self.model_args.n_layers
+                if hasattr(self.model_args, "n_layers")
+                else 0
+            ),
+            optimizer=self.optimizers,
+            fragment_fn=(
+                self.train_spec.fragment_fn
+                if hasattr(self.train_spec, "fragment_fn")
+                else None
+            ),
+        )
+
+        states = {"train_state": self}
+        if self.ft_manager.enabled and self.job_config.fault_tolerance.semi_sync_method is not None:
+            try:
+                outer_optimizers = {f"outer_optimizer_{i}": x._outer_optimizer for i,x in enumerate(self.semi_sync._fragments)}
+                states.update(outer_optimizers)
+            except Exception as e:
+                logger.warning("No outer optimizer found in semi_sync method, skipping checkpointing for the outer optimizer.")
+
         self.checkpointer = CheckpointManager(
             dataloader=self.dataloader,
             model_parts=self.model_parts,
             optimizers=self.optimizers,
             lr_schedulers=self.lr_schedulers,
-            states={"train_state": self},
+            states=states,
             checkpoint_config=job_config.checkpoint,
             sd_adapter=(
                 self.train_spec.state_dict_adapter(
@@ -316,6 +341,10 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
             base_folder=job_config.job.dump_folder,
             ft_manager=self.ft_manager,
         )
+
+
+
+
 
         loss_parallel_enabled = (
             parallel_dims.tp_enabled and not parallelism_config.disable_loss_parallel
@@ -532,6 +561,16 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
         self.checkpointer.load(step=job_config.checkpoint.load_step)
         logger.info(f"Training starts at step {self.step + 1}")
 
+        if self.job_config.fault_tolerance.semi_sync_method == 'diloco' and self.step > 0:
+            # if we loaded a checkpoint in semi_sync training, we don't need to recover
+            logger.info("Disabling immediate recovery in semi_sync training")
+
+            self.ft_manager._manager._init_sync = False 
+
+            for i, frag in enumerate(self.semi_sync._fragments):
+                # after loading, update parameters in the original_parameters dict
+                frag.save_parameters()
+
         leaf_folder = (
             ""
             if not self.ft_manager.enabled
@@ -550,22 +589,7 @@ class Trainer(torch.distributed.checkpoint.stateful.Stateful):
                 base_folder=job_config.job.dump_folder,
                 leaf_folder=leaf_folder,
             ) as memory_profiler,
-            maybe_semi_sync_training(
-                job_config.fault_tolerance,
-                ft_manager=self.ft_manager,
-                model=self.model_parts[0],
-                n_layers=(
-                    self.model_args.n_layers
-                    if hasattr(self.model_args, "n_layers")
-                    else 0
-                ),
-                optimizer=self.optimizers,
-                fragment_fn=(
-                    self.train_spec.fragment_fn
-                    if hasattr(self.train_spec, "fragment_fn")
-                    else None
-                ),
-            ),
+            self.semi_sync
         ):
             data_iterator = self.batch_generator(self.dataloader)
             while self.step < job_config.training.steps:
